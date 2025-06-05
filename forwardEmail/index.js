@@ -3,114 +3,126 @@ require('isomorphic-fetch');
 
 const { Client } = require('@microsoft/microsoft-graph-client');
 
-// --- searchMessageByMetadata: Search by exact receivedTime and subject, then validate recipients ---
-async function searchMessageByMetadata(client, subjectFromRequest, recipientsFromRequest, receivedTimeFromRequest, context) {
+// --- searchMessageByMetadata: Search by subject and body content snippet, then validate recipients ---
+async function searchMessageByMetadata(client, subjectFromRequest, recipientsFromRequest, contentSnippetFromRequest, context) {
     // Helper to encode strings for OData filters and trim them.
     const encodeOData = (str) => str ? str.replace(/'/g, "''").trim() : "";
 
     const encodedSubject = encodeOData(subjectFromRequest);
+    // Ensure contentSnippet is also trimmed. Graph 'contains' can be sensitive to leading/trailing whitespace.
+    const encodedContentSnippet = encodeOData(contentSnippetFromRequest); 
 
-    // receivedTimeFromRequest and encodedSubject are critical for this precise search strategy.
-    if (!receivedTimeFromRequest || typeof receivedTimeFromRequest !== 'string' || receivedTimeFromRequest.trim() === '') {
-        if (context && context.log) {
-            context.log.error("searchMessageByMetadata: receivedTimeFromRequest is missing, not a string, or empty. It is mandatory.");
-        }
-        throw new Error("receivedTimeFromRequest must be a valid ISO date string and is required.");
+    const initialODataFilterParts = [];
+    let primaryFilterCriteriaUsed = []; // To log what was used for the initial filter
+
+    // Add subject to filter if provided and not an empty string after trimming and encoding.
+    if (encodedSubject) {
+        initialODataFilterParts.push(`subject eq '${encodedSubject}'`);
+        primaryFilterCriteriaUsed.push("subject");
     }
-    if (!encodedSubject) {
+    // Add content snippet to filter if provided and not an empty string after trimming and encoding.
+    if (encodedContentSnippet) {
+        // Using 'contains' on body/content. Note: This can be less performant or more complex for Graph API
+        // than searching other indexed fields. Using a short, distinctive snippet is key.
+        // Ensure the snippet doesn't contain characters that would break the OData query if not handled by encodeOData.
+        initialODataFilterParts.push(`contains(body/content, '${encodedContentSnippet}')`);
+        primaryFilterCriteriaUsed.push("contentSnippet");
+    }
+    
+    // If neither subject nor content snippet was provided, the search is too broad.
+    if (initialODataFilterParts.length === 0) {
         if (context && context.log) {
-            context.log.error("searchMessageByMetadata: subjectFromRequest is missing or empty after encoding. It is mandatory.");
+            context.log.warn("searchMessageByMetadata: Called without subject or content snippet. Search is aborted as it would be too broad.");
         }
-        throw new Error("subjectFromRequest is required and cannot be empty for this search strategy.");
+        throw new Error("Search requires at least a subject or a content snippet to be specified for filtering.");
     }
 
-    // OData filter using exact receivedDateTime and subject.
-    const initialODataFilter = `receivedDateTime eq ${encodeOData(receivedTimeFromRequest)} and subject eq '${encodedSubject}'`;
-
-    if (context && context.log) context.log.info(`searchMessageByMetadata: Constructing OData filter for Graph API: ${initialODataFilter}`);
+    const initialODataFilter = initialODataFilterParts.join(' and ');
+    if (context && context.log) context.log.info(`searchMessageByMetadata: Constructing OData filter using [${primaryFilterCriteriaUsed.join(', ')}]: ${initialODataFilter}`);
 
     try {
-        // Fetch messages matching the exact time and subject.
-        // No .orderby() from API call. .top(5) as it's expected to be very specific.
+        // Fetch messages matching the initial filter. No .orderby() from API call.
+        // Increased .top() to allow for more candidates for client-side sorting and validation.
         const response = await client.api('/me/messages')
             .filter(initialODataFilter)
-            .top(5) // Expect few (ideally 1) matches for exact time & subject.
-            .select('id,receivedDateTime,subject,toRecipients')
+            .top(15) // Fetch a reasonable number, e.g., 15, for client-side processing.
+            .select('id,receivedDateTime,subject,toRecipients,bodyPreview') // bodyPreview might be useful for logging/verification.
             .get();
 
-        const validatedMessages = []; // To store messages that pass recipient validation
+        const validatedMessages = []; // To store messages that pass recipient validation.
 
         if (response.value && response.value.length > 0) {
-            if (context && context.log) context.log.info(`searchMessageByMetadata: Initial query (time & subject) returned ${response.value.length} message(s). Performing recipient validation if needed...`);
+            if (context && context.log) context.log.info(`searchMessageByMetadata: Initial query (using [${primaryFilterCriteriaUsed.join(', ')}]) returned ${response.value.length} message(s). Performing detailed client-side validation for recipients...`);
             
+            // Process recipients string from request into a clean list for validation.
             const fullRecipientList = recipientsFromRequest 
                 ? recipientsFromRequest.split(';').map(r => r.trim().toLowerCase()).filter(r => r) 
                 : [];
 
             for (const message of response.value) {
-                // Subject and Time are already matched by the API query.
+                // The initial API filter has already handled subject and content snippet matching.
                 // Now, validate recipients if they were provided in the request.
-                let recipientsMatch = true; // Assume match if no recipients were specified in the request.
+                let recipientsMatch = true; // Assume match if no recipients were specified in the request for validation.
                 
-                if (fullRecipientList.length > 0) { // Only validate if recipients were actually expected.
-                    recipientsMatch = false; // Reset to false, must be proven true.
+                if (fullRecipientList.length > 0) { // Only perform recipient validation if recipients were actually expected.
+                    recipientsMatch = false; // Reset to false, must be proven true by finding all expected recipients.
                     if (message.toRecipients && message.toRecipients.length > 0) {
+                        // Create a Set of the current message's recipients for efficient lookup.
                         const messageRecipientsSet = new Set(
                             message.toRecipients.map(r => r.emailAddress && r.emailAddress.address ? r.emailAddress.address.toLowerCase() : null).filter(Boolean)
                         );
                         
                         let allExpectedRecipientsFound = true;
-                        for (const expectedRecipient of fullRecipientList) {
+                        for (const expectedRecipient of fullRecipientList) { // fullRecipientList is already lowercased.
                             if (!messageRecipientsSet.has(expectedRecipient)) {
-                                allExpectedRecipientsFound = false; 
+                                allExpectedRecipientsFound = false; // An expected recipient is missing from this message.
                                 if (context && context.log) {
-                                    context.log.info(`searchMessageByMetadata: Message ${message.id} (Received: ${message.receivedDateTime}, Subject: "${message.subject}"): Recipient mismatch. Expected: "${expectedRecipient}", Found in msg: [${Array.from(messageRecipientsSet).join(', ')}].`);
+                                    context.log.info(`searchMessageByMetadata: Message ${message.id} (Subject: "${message.subject}"): Recipient mismatch during validation. Expected: "${expectedRecipient}", Found in message: [${Array.from(messageRecipientsSet).join(', ')}].`);
                                 }
-                                break; 
+                                break; // No need to check further recipients for this message.
                             }
                         }
-                        if (allExpectedRecipientsFound) recipientsMatch = true; 
-                    } else if (context && context.log) { 
-                        context.log.info(`searchMessageByMetadata: Message ${message.id} (Received: ${message.receivedDateTime}, Subject: "${message.subject}"): Recipient mismatch. Expected ${fullRecipientList.length} recipients, but message has none.`);
+                        if (allExpectedRecipientsFound) recipientsMatch = true; // All expected recipients were found in this message.
+                    } else if (context && context.log) { // Message has no recipients, but we expected some.
+                        context.log.info(`searchMessageByMetadata: Message ${message.id} (Subject: "${message.subject}"): Recipient mismatch. Expected ${fullRecipientList.length} recipients, but message has none.`);
                     }
                 }
                 
                 if (recipientsMatch) {
-                    // If recipient validation passes (or wasn't needed), add to our collection.
+                    // If recipient validation passes (or wasn't needed), add this message to our collection for sorting.
                     validatedMessages.push(message);
                 }
             }
 
             if (validatedMessages.length > 0) {
-                // If multiple messages passed (e.g. exact same email sent to different recipient groups at same microsecond,
-                // and recipient validation was not strict enough or not performed), sort by receivedDateTime.
-                // This sort is mostly a safeguard; with exact time filter, usually 0 or 1 item is expected after recipient validation.
+                // Sort the fully validated messages by receivedDateTime in descending order (latest first).
                 validatedMessages.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
                 
                 const latestMatchingMessage = validatedMessages[0];
                 if (context && context.log) context.log.info(`searchMessageByMetadata: SUCCESS - Found ${validatedMessages.length} fully matching message(s) after all validations. Latest is ID: ${latestMatchingMessage.id} (Received: "${latestMatchingMessage.receivedDateTime}", Subject: "${latestMatchingMessage.subject}").`);
-                return latestMatchingMessage.id;
+                return latestMatchingMessage.id; // Return the ID of the latest, fully validated message.
             } else {
-                 if (context && context.log) context.log.info("searchMessageByMetadata: No messages passed recipient validation after initial query by time & subject.");
+                 // No messages passed the recipient validation (if it was performed).
+                 if (context && context.log) context.log.info("searchMessageByMetadata: No messages passed recipient validation after initial query by subject & content.");
             }
 
-        } else if (context && context.log) { 
-            context.log.info(`searchMessageByMetadata: Initial OData query returned no messages. Filter used: "${initialODataFilter}"`);
+        } else if (context && context.log) { // Initial API query returned no messages.
+            context.log.info(`searchMessageByMetadata: Initial OData query returned no messages. Filter used (based on [${primaryFilterCriteriaUsed.join(', ')}]): "${initialODataFilter}"`);
         }
-        return null; // No message found matching all criteria
+        return null; // No message found matching all criteria.
     } catch (err) {
-        if (context && context.log) context.log.error(`searchMessageByMetadata: Error during Graph API call (Filter was: "${initialODataFilter}"): ${err.message}`);
-        // Check if the error is the "too complex" one.
+        if (context && context.log) context.log.error(`searchMessageByMetadata: Error during Graph API call (Filter was (based on [${primaryFilterCriteriaUsed.join(', ')}]): "${initialODataFilter}"): ${err.message}`);
+        // Specifically log if it's the "too complex" error.
         if (err.message && err.message.toLowerCase().includes("restriction or sort order is too complex")) {
-             context.log.error("searchMessageByMetadata: Encountered 'restriction or sort order is too complex' error even with simplified filter. This might indicate an issue with the specific subject/time values or a deeper Graph API limitation for this query pattern.");
+             context.log.error("searchMessageByMetadata: Encountered 'restriction or sort order is too complex' error. This suggests the combination of subject and contains(body/content) might still be too much for Graph API for this user's data, or the content snippet is problematic.");
         }
-        throw new Error(`Error in searchMessageByMetadata: ${err.message}`); 
+        throw new Error(`Error in searchMessageByMetadata: ${err.message}`); // Propagate the error.
     }
 }
 
 // --- Main Azure Function Handler ---
 module.exports = async function (context, req) {
-    context.log("Processing email forwarding request (Filter by Time & Subject, Validate Recipients Client-Side)...");
+    context.log("Processing email forwarding request (Filter by Subject & Content, Validate Recipients Client-Side)...");
 
     try {
         context.log(`Request Headers: ${JSON.stringify(req.headers)}`);
@@ -126,33 +138,39 @@ module.exports = async function (context, req) {
         const client = getAuthenticatedClient(accessToken);
         context.log("Graph client created with token.");
         
+        // Destructure payload from request body.
+        // Expecting subject, recipients, and contentSnippet.
         const {
             subject,
             recipients, 
-            receivedTime, // This is now crucial for the search
+            contentSnippet, 
+            // userEmail // Not directly used in this core search/forward logic
         } = req.body || {};
         
         let messageIdToProcess = null;
 
-        context.log.info(`Attempting metadata search. Criteria: Subject="${subject}", Recipients="${recipients}", ReceivedTime="${receivedTime}"`);
+        context.log.info(`Attempting metadata search. Criteria: Subject="${subject}", Recipients="${recipients}", ContentSnippet (length: ${contentSnippet ? contentSnippet.length : 0})`);
         try {
-            // Pass receivedTime to the search function
-            messageIdToProcess = await searchMessageByMetadata(client, subject, recipients, receivedTime, context);
+            // Call searchMessageByMetadata with the expected parameters.
+            messageIdToProcess = await searchMessageByMetadata(client, subject, recipients, contentSnippet, context);
             
             if (messageIdToProcess) {
                 context.log(`Metadata search successful. Found message with Graph REST ID: "${messageIdToProcess}".`);
             } else {
+                // If search returns null, no message fully matched all criteria.
                 const recipientsForLog = typeof recipients === 'string' ? recipients : JSON.stringify(recipients);
-                context.log.error(`Metadata search did not find a matching message. Criteria: Subject="${subject}", Recipients="${recipientsForLog}", ReceivedTime="${receivedTime}"`);
-                context.res = { status: 404, body: { success: false, error: `No message found via metadata search matching criteria (Subject: "${subject}", Recipients: "${recipientsForLog}", ReceivedTime: "${receivedTime}")` } };
+                context.log.error(`Metadata search did not find a matching message. Criteria: Subject="${subject}", Recipients="${recipientsForLog}", ContentSnippet (length: ${contentSnippet ? contentSnippet.length : 0})`);
+                context.res = { status: 404, body: { success: false, error: `No message found via metadata search matching criteria (Subject: "${subject}", Recipients: "${recipientsForLog}", ContentSnippet provided)` } };
                 return;
             }
         } catch (searchError) {
+            // Handle errors from searchMessageByMetadata (e.g., missing criteria, Graph API call failure).
             context.log.error(`Error during metadata search: ${searchError.message}`);
             context.res = { status: 500, body: { success: false, error: `Error searching for message via metadata: ${searchError.message}` } };
             return;
         }
         
+        // If messageIdToProcess is found, proceed with processing.
         context.log(`Proceeding to process message with Graph REST ID: "${messageIdToProcess}"`);
         
         try {
