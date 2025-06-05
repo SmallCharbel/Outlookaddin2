@@ -9,114 +9,113 @@ async function searchMessageByMetadata(client, subjectFromRequest, recipientsFro
     const encodeOData = (str) => str ? str.replace(/'/g, "''").trim() : "";
 
     const initialODataFilterParts = [];
+    let primaryFilterCriterionUsed = ""; // To log what was used for the initial filter
 
-    // Add subject to filter if provided and not an empty string after trimming.
     const encodedSubject = encodeOData(subjectFromRequest);
-    if (encodedSubject) {
-        initialODataFilterParts.push(`subject eq '${encodedSubject}'`);
-    }
-
-    // Process recipients string into a list of lowercase, trimmed, non-empty email addresses.
     const fullRecipientList = recipientsFromRequest 
         ? recipientsFromRequest.split(';').map(r => r.trim().toLowerCase()).filter(r => r) 
         : [];
+    const firstRecipientEncoded = (fullRecipientList.length > 0) ? encodeOData(fullRecipientList[0]) : null;
 
-    // If recipients are provided, use the first valid one in the initial OData filter.
-    // This helps narrow down results if the subject is too generic or missing.
-    if (fullRecipientList.length > 0) {
-        const firstRecipientEncoded = encodeOData(fullRecipientList[0]); // Already lowercased by previous map
-        if (firstRecipientEncoded) { // Ensure it's not empty after encoding (e.g. if original was just "'")
-            initialODataFilterParts.push(`toRecipients/any(r: r/emailAddress/address eq '${firstRecipientEncoded}')`);
-        }
+    // Strategy: Prioritize subject for initial filter. If no subject, use first recipient.
+    if (encodedSubject) {
+        initialODataFilterParts.push(`subject eq '${encodedSubject}'`);
+        primaryFilterCriterionUsed = "subject";
+    } else if (firstRecipientEncoded) {
+        initialODataFilterParts.push(`toRecipients/any(r: r/emailAddress/address eq '${firstRecipientEncoded}')`);
+        primaryFilterCriterionUsed = "firstRecipient";
     }
     
-    // If no subject AND no recipients were provided to filter by, the search is too broad.
-    // The function will throw an error to prevent an overly broad or potentially erroneous query.
     if (initialODataFilterParts.length === 0) {
         if (context && context.log) {
-            context.log.warn("searchMessageByMetadata: Called without subject or any recipients for initial filter. Search would be too broad and is aborted.");
+            context.log.warn("searchMessageByMetadata: Called without a valid subject or any recipients for the initial filter. Search is aborted as it would be too broad.");
         }
         throw new Error("Search requires at least a subject or recipients to be specified for filtering.");
     }
 
     const initialODataFilter = initialODataFilterParts.join(' and ');
-    if (context && context.log) context.log.info(`searchMessageByMetadata: Constructing OData filter for Graph API: ${initialODataFilter}`);
+    if (context && context.log) context.log.info(`searchMessageByMetadata: Constructing OData filter for Graph API using ${primaryFilterCriterionUsed}: ${initialODataFilter}`);
 
     try {
-        // Fetch top N messages (e.g., 5) matching the simplified initial filter, ordered by most recent.
-        // 'toRecipients' and 'subject' are selected for secondary validation post-fetch.
+        // Fetch messages matching the simplified initial filter.
+        // Removed .orderby() from API call. Increased .top() as we sort client-side.
         const response = await client.api('/me/messages')
             .filter(initialODataFilter)
-            .orderby('receivedDateTime desc') // Get the latest messages first
-            .top(5) // Fetch a small batch for secondary filtering, reducing API load.
+            .top(15) // Fetch more messages to sort client-side for "latest"
             .select('id,receivedDateTime,subject,toRecipients')
             .get();
 
+        const validatedMessages = [];
+
         if (response.value && response.value.length > 0) {
-            if (context && context.log) context.log.info(`searchMessageByMetadata: Initial query returned ${response.value.length} message(s). Performing detailed client-side validation...`);
+            if (context && context.log) context.log.info(`searchMessageByMetadata: Initial query (using ${primaryFilterCriterionUsed}) returned ${response.value.length} message(s). Performing detailed client-side validation...`);
             
-            // Iterate through the fetched messages for detailed validation.
             for (const message of response.value) {
-                // Secondary Validation:
-                // 1. Validate Subject:
-                //    If a subject was provided in the request, ensure the message's subject matches exactly (case-insensitive).
-                let subjectMatch = true; // Assume match if no subject was in the original request to filter by.
-                if (encodedSubject) { // Only check if a subject filter was applied.
+                let subjectMatch = true;
+                if (subjectFromRequest) {
                     const messageSubjectNormalized = message.subject ? message.subject.trim().toLowerCase() : "";
-                    // Compare with the normalized subject from the request.
-                    subjectMatch = (messageSubjectNormalized === encodedSubject.toLowerCase()); 
+                    subjectMatch = (messageSubjectNormalized === (encodedSubject ? encodedSubject.toLowerCase() : ""));
                     if (!subjectMatch && context && context.log) {
-                        context.log.info(`searchMessageByMetadata: Message ${message.id} (Received: ${message.receivedDateTime}): Subject mismatch post-query. Expected (normalized): "${encodedSubject.toLowerCase()}", Actual (normalized): "${messageSubjectNormalized}".`);
+                        // Log only if it's a mismatch for a subject we are actually checking
+                        if (encodedSubject) {
+                           context.log.info(`searchMessageByMetadata: Message ${message.id} (Received: ${message.receivedDateTime}): Subject mismatch. Expected: "${encodedSubject.toLowerCase()}", Actual: "${messageSubjectNormalized}".`);
+                        }
                     }
                 }
-                if (!subjectMatch) continue; // If subject doesn't align, skip to the next message.
+                if (!subjectMatch) continue;
 
-                // 2. Validate All Recipients:
-                //    If recipients were specified in the request, ensure ALL of them are present in this message's 'toRecipients'.
-                let recipientsMatch = true; // Assume match if no recipients were in the original request.
-                if (fullRecipientList.length > 0) { // Only validate if recipients were expected.
-                    recipientsMatch = false; // Reset to false, needs to be proven true.
+                let recipientsMatch = true;
+                if (fullRecipientList.length > 0) {
+                    recipientsMatch = false; 
                     if (message.toRecipients && message.toRecipients.length > 0) {
-                        // Create a Set of recipients from the current message for efficient lookup.
                         const messageRecipientsSet = new Set(
                             message.toRecipients.map(r => r.emailAddress && r.emailAddress.address ? r.emailAddress.address.toLowerCase() : null).filter(Boolean)
                         );
-                        
                         let allExpectedRecipientsFound = true;
-                        for (const expectedRecipient of fullRecipientList) { // fullRecipientList is already lowercased.
+                        for (const expectedRecipient of fullRecipientList) {
                             if (!messageRecipientsSet.has(expectedRecipient)) {
-                                allExpectedRecipientsFound = false; // An expected recipient is missing.
+                                allExpectedRecipientsFound = false; 
                                 if (context && context.log) {
-                                    context.log.info(`searchMessageByMetadata: Message ${message.id} (Received: ${message.receivedDateTime}): Recipient mismatch. Expected recipient "${expectedRecipient}" not found in message recipients: [${Array.from(messageRecipientsSet).join(', ')}].`);
+                                    context.log.info(`searchMessageByMetadata: Message ${message.id} (Received: ${message.receivedDateTime}): Recipient mismatch. Expected: "${expectedRecipient}", Found in msg: [${Array.from(messageRecipientsSet).join(', ')}].`);
                                 }
-                                break; // No need to check further recipients for this message.
+                                break; 
                             }
                         }
-                        if (allExpectedRecipientsFound) recipientsMatch = true; // All expected recipients were found.
-                    } else if (context && context.log) { // Message has no recipients, but we expected some.
+                        if (allExpectedRecipientsFound) recipientsMatch = true; 
+                    } else if (context && context.log) { 
                         context.log.info(`searchMessageByMetadata: Message ${message.id} (Received: ${message.receivedDateTime}): Recipient mismatch. Expected ${fullRecipientList.length} recipients, but message has none.`);
                     }
                 }
-                if (!recipientsMatch) continue; // If recipients don't align, skip to the next message.
+                if (!recipientsMatch) continue; 
 
-
-                // If all validations pass, this is the latest message matching all criteria.
-                if (context && context.log) context.log.info(`searchMessageByMetadata: SUCCESS - Message ${message.id} (Received: "${message.receivedDateTime}", Subject: "${message.subject}") passed all client-side validations.`);
-                return message.id; // Return the ID of the validated message.
+                // If all validations pass, add to our collection for sorting
+                validatedMessages.push(message);
             }
-            // If the loop completes, no message passed all detailed validations.
-            if (context && context.log) context.log.info("searchMessageByMetadata: No messages passed detailed client-side validation after initial query.");
-        } else if (context && context.log) { // Initial query returned no messages.
-            context.log.info(`searchMessageByMetadata: Initial OData query returned no messages. Filter used: "${initialODataFilter}"`);
+
+            if (validatedMessages.length > 0) {
+                // Sort the validated messages by receivedDateTime in descending order (latest first)
+                validatedMessages.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
+                
+                const latestMatchingMessage = validatedMessages[0];
+                if (context && context.log) context.log.info(`searchMessageByMetadata: SUCCESS - Found ${validatedMessages.length} fully matching message(s). Latest is ID: ${latestMatchingMessage.id} (Received: "${latestMatchingMessage.receivedDateTime}", Subject: "${latestMatchingMessage.subject}").`);
+                return latestMatchingMessage.id;
+            } else {
+                 if (context && context.log) context.log.info("searchMessageByMetadata: No messages passed detailed client-side validation after initial query.");
+            }
+
+        } else if (context && context.log) { 
+            context.log.info(`searchMessageByMetadata: Initial OData query returned no messages. Filter used (based on ${primaryFilterCriterionUsed}): "${initialODataFilter}"`);
         }
-        return null; // No message found matching all criteria.
+        return null; 
     } catch (err) {
-        if (context && context.log) context.log.error(`searchMessageByMetadata: Error during Graph API call (Filter was: "${initialODataFilter}"): ${err.message}`);
-        throw new Error(`Error in searchMessageByMetadata: ${err.message}`); // Propagate the error.
+        if (context && context.log) context.log.error(`searchMessageByMetadata: Error during Graph API call (Filter was (based on ${primaryFilterCriterionUsed}): "${initialODataFilter}"): ${err.message}`);
+        throw new Error(`Error in searchMessageByMetadata: ${err.message}`); 
     }
 }
 
 // --- Main Azure Function Handler ---
+// (The rest of the main handler function remains the same as in the provided immersive,
+//  as the changes are localized to searchMessageByMetadata)
 module.exports = async function (context, req) {
     context.log("Processing email forwarding request (Metadata Search Only Mode)...");
 
@@ -133,47 +132,34 @@ module.exports = async function (context, req) {
         const accessToken = authHeader.substring(7);
         const client = getAuthenticatedClient(accessToken);
         context.log("Graph client created with token.");
-
-        // Destructure payload from request body. ewsItemId is no longer expected.
-        // receivedTime is still received but not directly used in searchMessageByMetadata's filter.
+        
         const {
             subject,
-            recipients, // Expected to be a string (potentially empty) from command.html
-            // receivedTime, // Not directly passed to the new searchMessageByMetadata filter logic
-            // userEmail,    // Not used in core logic here
+            recipients, 
         } = req.body || {};
         
         let messageIdToProcess = null;
 
-        // Directly use metadata search as the only method.
-        // `useMetadataSearch` flag from payload is implicitly true.
         context.log.info(`Attempting metadata search. Criteria: Subject="${subject}", Recipients="${recipients}"`);
         try {
-            // Call searchMessageByMetadata. It will throw if subject and recipients are both missing/empty.
-            // The `recipients` variable passed here is the string from the request body.
             messageIdToProcess = await searchMessageByMetadata(client, subject, recipients, context);
             
             if (messageIdToProcess) {
                 context.log(`Metadata search successful. Found message with Graph REST ID: "${messageIdToProcess}".`);
             } else {
-                // If searchMessageByMetadata returns null, it means no message matched all criteria.
                 const recipientsForLog = typeof recipients === 'string' ? recipients : JSON.stringify(recipients);
                 context.log.error(`Metadata search did not find a matching message. Criteria: Subject="${subject}", Recipients="${recipientsForLog}"`);
                 context.res = { status: 404, body: { success: false, error: `No message found via metadata search matching criteria (Subject: "${subject}", Recipients: "${recipientsForLog}")` } };
                 return;
             }
         } catch (searchError) {
-            // Handle errors from searchMessageByMetadata (e.g., missing criteria, Graph API call failure).
             context.log.error(`Error during metadata search: ${searchError.message}`);
             context.res = { status: 500, body: { success: false, error: `Error searching for message via metadata: ${searchError.message}` } };
             return;
         }
         
-        // At this point, messageIdToProcess should be a valid Graph REST ID.
         context.log(`Proceeding to process message with Graph REST ID: "${messageIdToProcess}"`);
         
-        // --- Message Processing (Fetch, Draft, Attachments, Send, Move) ---
-        // This section remains largely the same, using messageIdToProcess.
         try {
             const message = await client.api(`/me/messages/${messageIdToProcess}`)
                 .select('subject,body,toRecipients,ccRecipients,bccRecipients,from,hasAttachments,importance,isRead')
@@ -184,13 +170,13 @@ module.exports = async function (context, req) {
             if (message.hasAttachments) {
                 context.log("Original message has attachments. Fetching attachment details...");
                 const attachmentsResponse = await client.api(`/me/messages/${messageIdToProcess}/attachments`).get();
-                attachments = attachmentsResponse.value || []; // Ensure attachments is an array.
+                attachments = attachmentsResponse.value || []; 
                 context.log(`Found ${attachments.length} attachments in the original message.`);
             }
 
             context.log("Creating new message draft for forwarding...");
             const newMessage = {
-                subject: `${message.subject}`, // Preserve original subject.
+                subject: `${message.subject}`, 
                 body: { contentType: message.body.contentType, content: message.body.content },
                 toRecipients: message.toRecipients || [],
                 ccRecipients: message.ccRecipients || [],
@@ -209,7 +195,6 @@ module.exports = async function (context, req) {
                             name: attachment.name,
                             contentType: attachment.contentType,
                         };
-                        // Populate specific properties based on attachment type.
                         if (attachment["@odata.type"] === "#microsoft.graph.fileAttachment" && attachment.contentBytes) {
                             attachmentData.contentBytes = attachment.contentBytes;
                         } else if (attachment["@odata.type"] === "#microsoft.graph.itemAttachment" && attachment.item) {
@@ -223,14 +208,13 @@ module.exports = async function (context, req) {
                                    attachment["@odata.type"] !== "#microsoft.graph.itemAttachment" && 
                                    attachment["@odata.type"] !== "#microsoft.graph.referenceAttachment") {
                              context.log.warn(`Unsupported attachment type or missing critical data for attachment "${attachment.name}" (Type: ${attachment["@odata.type"]}). Skipping.`);
-                             continue; // Skip this attachment.
+                             continue; 
                         } else if(!attachmentData.contentBytes && !attachmentData.item && !attachmentData.sourceUrl && 
                                   (attachment["@odata.type"] === "#microsoft.graph.fileAttachment" || 
                                    attachment["@odata.type"] === "#microsoft.graph.itemAttachment" || 
                                    attachment["@odata.type"] === "#microsoft.graph.referenceAttachment") ) { 
-                            // Known type but essential data missing.
                             context.log.warn(`Attachment "${attachment.name}" (Type: ${attachment["@odata.type"]}) is a known type but missing required data (e.g., contentBytes, item, sourceUrl). Skipping.`);
-                            continue; // Skip this attachment.
+                            continue; 
                         }
 
                         await client.api(`/me/messages/${draftMessage.id}/attachments`).post(attachmentData);
@@ -238,7 +222,6 @@ module.exports = async function (context, req) {
                     } catch (attachError) {
                         const errBody = attachError.body ? JSON.stringify(attachError.body) : 'N/A';
                         context.log.error(`Error adding attachment "${attachment.name}" to draft ${draftMessage.id}: ${attachError.message}. Error Body: ${errBody}`);
-                        // Continue with other attachments even if one fails.
                     }
                 }
             }
@@ -255,15 +238,14 @@ module.exports = async function (context, req) {
             context.res = { status: 200, body: { success: true, message: "Email forwarded and original moved to deleted items successfully." } };
 
         } catch (processingError) {
-            // Handle errors related to fetching/processing the message *after* its ID is known.
             context.log.error(`Error during message processing/forwarding for Graph REST ID "${messageIdToProcess}": ${processingError.message}`);
             let errMsg = `Error processing message (ID: "${messageIdToProcess}"): ${processingError.message}`;
-            if (processingError.statusCode && processingError.code) { // Check if it's a Graph API error object.
+            if (processingError.statusCode && processingError.code) { 
                 errMsg = `Graph API Error (${processingError.code}) for message ID "${messageIdToProcess}": ${processingError.message}`;
             }
             context.res = { status: (processingError.statusCode === 404 ? 404 : 500), body: { success: false, error: errMsg, messageIdUsed: messageIdToProcess } };
         }
-    } catch (error) { // Outermost catch block for any unhandled errors.
+    } catch (error) { 
         context.log.error(`Unhandled error in Azure Function: ${error.message}`);
         context.res = { status: 500, body: { success: false, error: `Critical error in email forwarding process: ${error.message}` } };
     }
@@ -274,5 +256,3 @@ function getAuthenticatedClient(accessToken) {
     const client = Client.init({ authProvider: (done) => done(null, accessToken) });
     return client;
 }
-
-// convertExchangeId and validateMessageId functions are no longer needed as EWS ID is not used.
