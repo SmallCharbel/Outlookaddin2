@@ -120,9 +120,10 @@ async function searchMessageByMetadata(client, subjectFromRequest, recipientsFro
     }
 }
 
+
 // --- Main Azure Function Handler ---
 module.exports = async function (context, req) {
-    context.log("Processing email forwarding request (Filter by Subject & Content, Validate Recipients Client-Side)...");
+    context.log("Processing email forwarding request (EWSID or Metadata Search)...");
 
     try {
         context.log(`Request Headers: ${JSON.stringify(req.headers)}`);
@@ -139,43 +140,77 @@ module.exports = async function (context, req) {
         context.log("Graph client created with token.");
         
         // Destructure payload from request body.
-        // Expecting subject, recipients, and contentSnippet.
+        // Expecting ewsItemId, subject, recipients, contentSnippet, userEmail, useMetadataSearch
         const {
+            ewsItemId,
             subject,
             recipients, 
-            contentSnippet, 
-            // userEmail // Not directly used in this core search/forward logic
+            contentSnippet,
+            userEmail,
+            useMetadataSearch // boolean indicating fallback behavior
         } = req.body || {};
         
         let messageIdToProcess = null;
 
-        context.log.info(`Attempting metadata search. Criteria: Subject="${subject}", Recipients="${recipients}", ContentSnippet (length: ${contentSnippet ? contentSnippet.length : 0})`);
-        try {
-            // Call searchMessageByMetadata with the expected parameters.
-            messageIdToProcess = await searchMessageByMetadata(client, subject, recipients, contentSnippet, context);
-            
-            if (messageIdToProcess) {
-                context.log(`Metadata search successful. Found message with Graph REST ID: "${messageIdToProcess}".`);
-            } else {
-                // If search returns null, no message fully matched all criteria.
-                const recipientsForLog = typeof recipients === 'string' ? recipients : JSON.stringify(recipients);
-                context.log.error(`Metadata search did not find a matching message. Criteria: Subject="${subject}", Recipients="${recipientsForLog}", ContentSnippet (length: ${contentSnippet ? contentSnippet.length : 0})`);
-                context.res = { status: 404, body: { success: false, error: `No message found via metadata search matching criteria (Subject: "${subject}", Recipients: "${recipientsForLog}", ContentSnippet provided)` } };
+        // If an EWS Item ID is provided, convert it to a REST (Graph) ID using translateExchangeIds
+        if (ewsItemId && typeof ewsItemId === 'string' && ewsItemId.trim()) {
+            try {
+                context.log.info(`Attempting to convert EWS ID to Graph ID: "${ewsItemId}"`);
+                const translateResponse = await client.api('/me/translateExchangeIds').post({
+                    inputIds: [ewsItemId],
+                    targetIdType: 'restId',
+                    sourceIdType: 'ewsId'
+                });
+
+                if (translateResponse && Array.isArray(translateResponse.value) && translateResponse.value.length > 0) {
+                    messageIdToProcess = translateResponse.value[0].id || translateResponse.value[0];
+                    context.log.info(`Conversion successful. Graph Message ID: "${messageIdToProcess}"`);
+                } else {
+                    context.log.error("translateExchangeIds did not return a valid result.");
+                }
+            } catch (convertError) {
+                context.log.error(`Error converting EWS ID to Graph ID: ${convertError.message}`);
+                // If conversion fails and metadata search is allowed, fall back to metadata search.
+                if (!useMetadataSearch) {
+                    context.res = { status: 400, body: { success: false, error: `Failed to convert EWS ID: ${convertError.message}` } };
+                    return;
+                }
+                context.log.info("Falling back to metadata search due to EWS ID conversion failure.");
+            }
+        }
+
+        // If EWS conversion did not yield an ID and metadata search is enabled, perform metadata search.
+        if (!messageIdToProcess && useMetadataSearch) {
+            context.log.info(`Attempting metadata search. Criteria: Subject="${subject}", Recipients="${recipients}", ContentSnippet (length: ${contentSnippet ? contentSnippet.length : 0})`);
+            try {
+                messageIdToProcess = await searchMessageByMetadata(client, subject, recipients, contentSnippet, context);
+                if (messageIdToProcess) {
+                    context.log(`Metadata search successful. Found message with Graph REST ID: "${messageIdToProcess}".`);
+                } else {
+                    const recipientsForLog = typeof recipients === 'string' ? recipients : JSON.stringify(recipients);
+                    context.log.error(`Metadata search did not find a matching message. Criteria: Subject="${subject}", Recipients="${recipientsForLog}", ContentSnippet provided.`);
+                    context.res = { status: 404, body: { success: false, error: `No message found via metadata search matching criteria (Subject: "${subject}", Recipients: "${recipientsForLog}", ContentSnippet provided)` } };
+                    return;
+                }
+            } catch (searchError) {
+                context.log.error(`Error during metadata search: ${searchError.message}`);
+                context.res = { status: 500, body: { success: false, error: `Error searching for message via metadata: ${searchError.message}` } };
                 return;
             }
-        } catch (searchError) {
-            // Handle errors from searchMessageByMetadata (e.g., missing criteria, Graph API call failure).
-            context.log.error(`Error during metadata search: ${searchError.message}`);
-            context.res = { status: 500, body: { success: false, error: `Error searching for message via metadata: ${searchError.message}` } };
+        }
+
+        if (!messageIdToProcess) {
+            // No ID found via EWS conversion or metadata search.
+            context.res = { status: 400, body: { success: false, error: "No valid message ID to process. Please check EWS ID or search criteria." } };
             return;
         }
-        
-        // If messageIdToProcess is found, proceed with processing.
+
+        // If messageIdToProcess is found (either via EWS conversion or metadata search), proceed with processing.
         context.log(`Proceeding to process message with Graph REST ID: "${messageIdToProcess}"`);
         
         try {
             const message = await client.api(`/me/messages/${messageIdToProcess}`)
-                .select('subject,body,toRecipients,ccRecipients,bccRecipients,from,hasAttachments,importance,isRead')
+                .select('subject,body,bodyPreview,toRecipients,ccRecipients,bccRecipients,from,hasAttachments,importance,isRead')
                 .get();
             context.log(`Successfully retrieved original message: "${message.subject}" (ID: ${message.id})`);
 
@@ -183,7 +218,7 @@ module.exports = async function (context, req) {
             if (message.hasAttachments) {
                 context.log("Original message has attachments. Fetching attachment details...");
                 const attachmentsResponse = await client.api(`/me/messages/${messageIdToProcess}/attachments`).get();
-                attachments = attachmentsResponse.value || []; 
+                attachments = attachmentsResponse.value || [];
                 context.log(`Found ${attachments.length} attachments in the original message.`);
             }
 
