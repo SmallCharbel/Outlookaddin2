@@ -22,9 +22,6 @@ async function searchMessageByMetadata(client, subjectFromRequest, recipientsFro
     }
     // Add content snippet to filter if provided and not an empty string after trimming and encoding.
     if (encodedContentSnippet) {
-        // Using 'contains' on body/content. Note: This can be less performant or more complex for Graph API
-        // than searching other indexed fields. Using a short, distinctive snippet is key.
-        // Ensure the snippet doesn't contain characters that would break the OData query if not handled by encodeOData.
         initialODataFilterParts.push(`contains(body/content, '${encodedContentSnippet}')`);
         primaryFilterCriteriaUsed.push("contentSnippet");
     }
@@ -41,85 +38,65 @@ async function searchMessageByMetadata(client, subjectFromRequest, recipientsFro
     if (context && context.log) context.log.info(`searchMessageByMetadata: Constructing OData filter using [${primaryFilterCriteriaUsed.join(', ')}]: ${initialODataFilter}`);
 
     try {
-        // Fetch messages matching the initial filter. No .orderby() from API call.
-        // Increased .top() to allow for more candidates for client-side sorting and validation.
         const response = await client.api('/me/messages')
             .filter(initialODataFilter)
-            .top(15) // Fetch a reasonable number, e.g., 15, for client-side processing.
-            .select('id,receivedDateTime,subject,toRecipients,bodyPreview') // bodyPreview might be useful for logging/verification.
+            .top(15)
+            .select('id,receivedDateTime,subject,toRecipients,bodyPreview')
             .get();
 
-        const validatedMessages = []; // To store messages that pass recipient validation.
+        const validatedMessages = [];
 
         if (response.value && response.value.length > 0) {
             if (context && context.log) context.log.info(`searchMessageByMetadata: Initial query (using [${primaryFilterCriteriaUsed.join(', ')}]) returned ${response.value.length} message(s). Performing detailed client-side validation for recipients...`);
-            
-            // Process recipients string from request into a clean list for validation.
             const fullRecipientList = recipientsFromRequest 
                 ? recipientsFromRequest.split(';').map(r => r.trim().toLowerCase()).filter(r => r) 
                 : [];
 
             for (const message of response.value) {
-                // The initial API filter has already handled subject and content snippet matching.
-                // Now, validate recipients if they were provided in the request.
-                let recipientsMatch = true; // Assume match if no recipients were specified in the request for validation.
-                
-                if (fullRecipientList.length > 0) { // Only perform recipient validation if recipients were actually expected.
-                    recipientsMatch = false; // Reset to false, must be proven true by finding all expected recipients.
+                let recipientsMatch = true;
+                if (fullRecipientList.length > 0) {
+                    recipientsMatch = false;
                     if (message.toRecipients && message.toRecipients.length > 0) {
-                        // Create a Set of the current message's recipients for efficient lookup.
                         const messageRecipientsSet = new Set(
                             message.toRecipients.map(r => r.emailAddress && r.emailAddress.address ? r.emailAddress.address.toLowerCase() : null).filter(Boolean)
                         );
-                        
                         let allExpectedRecipientsFound = true;
-                        for (const expectedRecipient of fullRecipientList) { // fullRecipientList is already lowercased.
+                        for (const expectedRecipient of fullRecipientList) {
                             if (!messageRecipientsSet.has(expectedRecipient)) {
-                                allExpectedRecipientsFound = false; // An expected recipient is missing from this message.
+                                allExpectedRecipientsFound = false;
                                 if (context && context.log) {
-                                    context.log.info(`searchMessageByMetadata: Message ${message.id} (Subject: "${message.subject}"): Recipient mismatch during validation. Expected: "${expectedRecipient}", Found in message: [${Array.from(messageRecipientsSet).join(', ')}].`);
+                                    context.log.info(`searchMessageByMetadata: Message ${message.id} (Subject: "${message.subject}"): Recipient mismatch. Expected: "${expectedRecipient}".`);
                                 }
-                                break; // No need to check further recipients for this message.
+                                break;
                             }
                         }
-                        if (allExpectedRecipientsFound) recipientsMatch = true; // All expected recipients were found in this message.
-                    } else if (context && context.log) { // Message has no recipients, but we expected some.
-                        context.log.info(`searchMessageByMetadata: Message ${message.id} (Subject: "${message.subject}"): Recipient mismatch. Expected ${fullRecipientList.length} recipients, but message has none.`);
+                        if (allExpectedRecipientsFound) recipientsMatch = true;
+                    } else if (context && context.log) {
+                        context.log.info(`searchMessageByMetadata: Message ${message.id} (Subject: "${message.subject}"): Expected recipients but none present.`);
                     }
                 }
-                
                 if (recipientsMatch) {
-                    // If recipient validation passes (or wasn't needed), add this message to our collection for sorting.
                     validatedMessages.push(message);
                 }
             }
 
             if (validatedMessages.length > 0) {
-                // Sort the fully validated messages by receivedDateTime in descending order (latest first).
                 validatedMessages.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
-                
                 const latestMatchingMessage = validatedMessages[0];
-                if (context && context.log) context.log.info(`searchMessageByMetadata: SUCCESS - Found ${validatedMessages.length} fully matching message(s) after all validations. Latest is ID: ${latestMatchingMessage.id} (Received: "${latestMatchingMessage.receivedDateTime}", Subject: "${latestMatchingMessage.subject}").`);
-                return latestMatchingMessage.id; // Return the ID of the latest, fully validated message.
+                if (context && context.log) context.log.info(`searchMessageByMetadata: SUCCESS - Latest ID: ${latestMatchingMessage.id} (Received: ${latestMatchingMessage.receivedDateTime}).`);
+                return latestMatchingMessage.id;
             } else {
-                 // No messages passed the recipient validation (if it was performed).
-                 if (context && context.log) context.log.info("searchMessageByMetadata: No messages passed recipient validation after initial query by subject & content.");
+                if (context && context.log) context.log.info("searchMessageByMetadata: No messages passed recipient validation.");
             }
-
-        } else if (context && context.log) { // Initial API query returned no messages.
-            context.log.info(`searchMessageByMetadata: Initial OData query returned no messages. Filter used (based on [${primaryFilterCriteriaUsed.join(', ')}]): "${initialODataFilter}"`);
+        } else if (context && context.log) {
+            context.log.info(`searchMessageByMetadata: No messages returned. Filter: "${initialODataFilter}"`);
         }
-        return null; // No message found matching all criteria.
+        return null;
     } catch (err) {
-        if (context && context.log) context.log.error(`searchMessageByMetadata: Error during Graph API call (Filter was (based on [${primaryFilterCriteriaUsed.join(', ')}]): "${initialODataFilter}"): ${err.message}`);
-        // Specifically log if it's the "too complex" error.
-        if (err.message && err.message.toLowerCase().includes("restriction or sort order is too complex")) {
-             context.log.error("searchMessageByMetadata: Encountered 'restriction or sort order is too complex' error. This suggests the combination of subject and contains(body/content) might still be too much for Graph API for this user's data, or the content snippet is problematic.");
-        }
-        throw new Error(`Error in searchMessageByMetadata: ${err.message}`); // Propagate the error.
+        if (context && context.log) context.log.error(`searchMessageByMetadata: Graph API call error: ${err.message}`);
+        throw new Error(`Error in searchMessageByMetadata: ${err.message}`);
     }
 }
-
 
 // --- Main Azure Function Handler ---
 module.exports = async function (context, req) {
@@ -131,119 +108,94 @@ module.exports = async function (context, req) {
 
         const authHeader = req.headers.authorization || '';
         if (!authHeader.startsWith('Bearer ')) {
-            context.log.error("Unauthorized: No authorization token provided.");
-            context.res = { status: 401, body: { success: false, error: "Unauthorized: No token provided" } };
+            context.log.error("Unauthorized: No token.");
+            context.res = { status: 401, body: { success: false, error: "Unauthorized: No token" } };
             return;
         }
         const accessToken = authHeader.substring(7);
         const client = getAuthenticatedClient(accessToken);
-        context.log("Graph client created with token.");
-        
-        // Destructure payload from request body.
-        // Expecting ewsItemId, subject, recipients, contentSnippet, userEmail, useMetadataSearch
-        const {
-            ewsItemId,
-            subject,
-            recipients, 
-            contentSnippet,
-            userEmail,
-            useMetadataSearch // boolean indicating fallback behavior
-        } = req.body || {};
-        
+        context.log("Graph client ready.");
+
+        const { ewsItemId, subject, recipients, contentSnippet, userEmail, useMetadataSearch } = req.body || {};
         let messageIdToProcess = null;
 
-        // If an EWS Item ID is provided, convert it to a REST (Graph) ID using translateExchangeIds
         if (ewsItemId && typeof ewsItemId === 'string' && ewsItemId.trim()) {
             try {
-                context.log.info(`Attempting to convert EWS ID to Graph ID: "${ewsItemId}"`);
+                context.log.info(`Converting EWS ID: ${ewsItemId}`);
                 const translateResponse = await client.api('/me/translateExchangeIds').post({
-                    inputIds: [ewsItemId],
-                    targetIdType: 'restId',
-                    sourceIdType: 'ewsId'
+                    inputIds: [ewsItemId], targetIdType: 'restId', sourceIdType: 'ewsId'
                 });
-
                 if (translateResponse && Array.isArray(translateResponse.value) && translateResponse.value.length > 0) {
-                    // Use the targetId property returned by Graph
                     messageIdToProcess = translateResponse.value[0].targetId;
-                    context.log.info(`Conversion successful. Graph Message ID: "${messageIdToProcess}"`);
+                    context.log.info(`Converted to Graph ID: ${messageIdToProcess}`);
                 } else {
-                    context.log.error("translateExchangeIds did not return a valid result.");
+                    context.log.error("translateExchangeIds returned no value.");
                 }
             } catch (convertError) {
-                context.log.error(`Error converting EWS ID to Graph ID: ${convertError.message}`);
-                // If conversion fails and metadata search is allowed, fall back to metadata search.
+                context.log.error(`translateExchangeIds error: ${convertError.message}`);
                 if (!useMetadataSearch) {
-                    context.res = { status: 400, body: { success: false, error: `Failed to convert EWS ID: ${convertError.message}` } };
+                    context.res = { status: 400, body: { success: false, error: convertError.message } };
                     return;
                 }
-                context.log.info("Falling back to metadata search due to EWS ID conversion failure.");
+                context.log.info("Falling back to metadata search.");
             }
         }
 
-        // If EWS conversion did not yield an ID and metadata search is enabled, perform metadata search.
         if (!messageIdToProcess && useMetadataSearch) {
-            context.log.info(`Attempting metadata search. Criteria: Subject="${subject}", Recipients="${recipients}", ContentSnippet (length: ${contentSnippet ? contentSnippet.length : 0})`);
+            context.log.info(`Metadata search with Subject: ${subject}`);
             try {
                 messageIdToProcess = await searchMessageByMetadata(client, subject, recipients, contentSnippet, context);
-                if (messageIdToProcess) {
-                    context.log(`Metadata search successful. Found message with Graph REST ID: "${messageIdToProcess}".`);
-                } else {
-                    const recipientsForLog = typeof recipients === 'string' ? recipients : JSON.stringify(recipients);
-                    context.log.error(`Metadata search did not find a matching message. Criteria: Subject="${subject}", Recipients="${recipientsForLog}", ContentSnippet provided.`);
-                    context.res = { status: 404, body: { success: false, error: `No message found via metadata search matching criteria (Subject: "${subject}", Recipients: "${recipientsForLog}", ContentSnippet provided)` } };
+                if (!messageIdToProcess) {
+                    context.res = { status: 404, body: { success: false, error: "No match via metadata." } };
                     return;
                 }
+                context.log.info(`Metadata found Graph ID: ${messageIdToProcess}`);
             } catch (searchError) {
-                context.log.error(`Error during metadata search: ${searchError.message}`);
-                context.res = { status: 500, body: { success: false, error: `Error searching for message via metadata: ${searchError.message}` } };
+                context.log.error(`Metadata search error: ${searchError.message}`);
+                context.res = { status: 500, body: { success: false, error: searchError.message } };
                 return;
             }
         }
 
         if (!messageIdToProcess) {
-            // No ID found via EWS conversion or metadata search.
-            context.res = { status: 400, body: { success: false, error: "No valid message ID to process. Please check EWS ID or search criteria." } };
+            context.res = { status: 400, body: { success: false, error: "No valid message ID." } };
             return;
         }
 
-        // If messageIdToProcess is found (either via EWS conversion or metadata search), proceed with processing.
-        context.log(`Proceeding to process message with Graph REST ID: "${messageIdToProcess}"`);
-        
+        const encodedMessageId = encodeURIComponent(messageIdToProcess);
+        context.log(`Processing message with ID: ${encodedMessageId}`);
         try {
-            const message = await client.api(`/me/messages/${messageIdToProcess}`)
+            const message = await client.api(`/me/messages/${encodedMessageId}`)
                 .select('subject,body,bodyPreview,toRecipients,ccRecipients,bccRecipients,from,hasAttachments,importance,isRead')
                 .get();
-            context.log(`Successfully retrieved original message: "${message.subject}" (ID: ${message.id})`);
+            context.log(`Retrieved message: ${message.subject}`);
 
             let attachments = [];
             if (message.hasAttachments) {
-                context.log("Original message has attachments. Fetching attachment details...");
-                const attachmentsResponse = await client.api(`/me/messages/${messageIdToProcess}/attachments`).get();
+                context.log("Fetching attachments...");
+                const attachmentsResponse = await client.api(`/me/messages/${encodedMessageId}/attachments`).get();
                 attachments = attachmentsResponse.value || [];
-                context.log(`Found ${attachments.length} attachments in the original message.`);
+                context.log(`Found ${attachments.length} attachments.`);
             }
 
-            context.log("Creating new message draft for forwarding...");
+            context.log("Creating draft...");
             const newMessage = {
-                subject: `${message.subject}`, 
+                subject: message.subject,
                 body: { contentType: message.body.contentType, content: message.body.content },
                 toRecipients: message.toRecipients || [],
                 ccRecipients: message.ccRecipients || [],
                 importance: message.importance || "normal"
             };
             const draftMessage = await client.api('/me/messages').post(newMessage);
-            context.log(`New draft message created with ID: ${draftMessage.id}. Subject: "${draftMessage.subject}"`);
+            const draftId = encodeURIComponent(draftMessage.id);
+            context.log(`Draft created with ID: ${draftMessage.id}`);
 
             if (attachments.length > 0) {
-                context.log(`Adding ${attachments.length} attachments to the new draft...");
+                context.log(`Adding ${attachments.length} attachments to draft...`);
                 for (const attachment of attachments) {
-                    context.log(`Processing attachment: "${attachment.name}" (Type: ${attachment["@odata.type"]})`);
+                    context.log(`Attachment: ${attachment.name}`);
                     try {
-                        const attachmentData = {
-                            "@odata.type": attachment["@odata.type"],
-                            name: attachment.name,
-                            contentType: attachment.contentType,
-                        };
+                        const attachmentData = { "@odata.type": attachment["@odata.type"], name: attachment.name, contentType: attachment.contentType };
                         if (attachment["@odata.type"] === "#microsoft.graph.fileAttachment" && attachment.contentBytes) {
                             attachmentData.contentBytes = attachment.contentBytes;
                         } else if (attachment["@odata.type"] === "#microsoft.graph.itemAttachment" && attachment.item) {
@@ -253,55 +205,39 @@ module.exports = async function (context, req) {
                             attachmentData.providerType = attachment.providerType;
                             if (attachment.permission) attachmentData.permission = attachment.permission;
                             if (typeof attachment.isFolder === 'boolean') attachmentData.isFolder = attachment.isFolder;
-                        } else if (attachment["@odata.type"] !== "#microsoft.graph.fileAttachment" && 
-                                   attachment["@odata.type"] !== "#microsoft.graph.itemAttachment" && 
-                                   attachment["@odata.type"] !== "#microsoft.graph.referenceAttachment") {
-                             context.log.warn(`Unsupported attachment type or missing critical data for attachment "${attachment.name}" (Type: ${attachment["@odata.type"]}). Skipping.`);
-                             continue; 
-                        } else if(!attachmentData.contentBytes && !attachmentData.item && !attachmentData.sourceUrl && 
-                                  (attachment["@odata.type"] === "#microsoft.graph.fileAttachment" || 
-                                   attachment["@odata.type"] === "#microsoft.graph.itemAttachment" || 
-                                   attachment["@odata.type"] === "#microsoft.graph.referenceAttachment") ) { 
-                            context.log.warn(`Attachment "${attachment.name}" (Type: ${attachment["@odata.type"]}) is a known type but missing required data (e.g., contentBytes, item, sourceUrl). Skipping.`);
-                            continue; 
+                        } else {
+                            context.log.warn(`Skipping unsupported attachment type for ${attachment.name}`);
+                            continue;
                         }
-
-                        await client.api(`/me/messages/${draftMessage.id}/attachments`).post(attachmentData);
-                        context.log(`Successfully added attachment "${attachment.name}" to draft ${draftMessage.id}.`);
+                        await client.api(`/me/messages/${draftId}/attachments`).post(attachmentData);
+                        context.log(`Added attachment: ${attachment.name}`);
                     } catch (attachError) {
-                        const errBody = attachError.body ? JSON.stringify(attachError.body) : 'N/A';
-                        context.log.error(`Error adding attachment "${attachment.name}" to draft ${draftMessage.id}: ${attachError.message}. Error Body: ${errBody}`);
+                        context.log.error(`Error adding attachment: ${attachError.message}`);
                     }
                 }
             }
 
-            context.log(`Sending the new message (draft ID: ${draftMessage.id})...");
-            await client.api(`/me/messages/${draftMessage.id}/send`).post({});
-            context.log(`Successfully sent forwarded message. Original message ID was ${messageIdToProcess}.`);
+            context.log("Sending draft...");
+            await client.api(`/me/messages/${draftId}/send`).post({});
+            context.log("Draft sent.");
 
-            context.log(`Moving original message (ID: ${messageIdToProcess}) to deleted items...");
-            await client.api(`/me/messages/${messageIdToProcess}/move`).post({ destinationId: "deleteditems" });
-            context.log(`Successfully moved original message (ID: ${messageIdToProcess}) to deleted items.`);
+            context.log("Moving original to deleted items...");
+            await client.api(`/me/messages/${encodedMessageId}/move`).post({ destinationId: "deleteditems" });
+            context.log("Moved to deleted items.");
 
-            context.log("Email forwarding process completed successfully.");
-            context.res = { status: 200, body: { success: true, message: "Email forwarded and original moved to deleted items successfully." } };
-
+            context.res = { status: 200, body: { success: true, message: "Forwarded and moved." } };
         } catch (processingError) {
-            context.log.error(`Error during message processing/forwarding for Graph REST ID "${messageIdToProcess}": ${processingError.message}`);
-            let errMsg = `Error processing message (ID: "${messageIdToProcess}"): ${processingError.message}`;
-            if (processingError.statusCode && processingError.code) { 
-                errMsg = `Graph API Error (${processingError.code}) for message ID "${messageIdToProcess}": ${processingError.message}`;
-            }
-            context.res = { status: (processingError.statusCode === 404 ? 404 : 500), body: { success: false, error: errMsg, messageIdUsed: messageIdToProcess } };
+            context.log.error(`Processing error: ${processingError.message}`);
+            const errMsg = processingError.code ? `Graph API Error (${processingError.code}): ${processingError.message}` : processingError.message;
+            context.res = { status: 500, body: { success: false, error: errMsg } };
         }
-    } catch (error) { 
-        context.log.error(`Unhandled error in Azure Function: ${error.message}`);
-        context.res = { status: 500, body: { success: false, error: `Critical error in email forwarding process: ${error.message}` } };
+    } catch (error) {
+        context.log.error(`Unhandled error: ${error.message}`);
+        context.res = { status: 500, body: { success: false, error: `Critical error: ${error.message}` } };
     }
 };
 
 // --- Helper Functions ---
 function getAuthenticatedClient(accessToken) {
-    const client = Client.init({ authProvider: (done) => done(null, accessToken) });
-    return client;
+    return Client.init({ authProvider: (done) => done(null, accessToken) });
 }
