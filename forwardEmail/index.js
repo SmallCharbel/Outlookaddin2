@@ -163,7 +163,8 @@ module.exports = async function (context, req) {
                 });
 
                 if (translateResponse && Array.isArray(translateResponse.value) && translateResponse.value.length > 0) {
-                    messageIdToProcess = translateResponse.value[0].id || translateResponse.value[0];
+                    // Use the targetId property returned by Graph
+                    messageIdToProcess = translateResponse.value[0].targetId;
                     context.log.info(`Conversion successful. Graph Message ID: "${messageIdToProcess}"`);
                 } else {
                     context.log.error("translateExchangeIds did not return a valid result.");
@@ -234,7 +235,7 @@ module.exports = async function (context, req) {
             context.log(`New draft message created with ID: ${draftMessage.id}. Subject: "${draftMessage.subject}"`);
 
             if (attachments.length > 0) {
-                context.log(`Adding ${attachments.length} attachments to the new draft...`);
+                context.log(`Adding ${attachments.length} attachments to the new draft...");
                 for (const attachment of attachments) {
                     context.log(`Processing attachment: "${attachment.name}" (Type: ${attachment["@odata.type"]})`);
                     try {
@@ -274,11 +275,11 @@ module.exports = async function (context, req) {
                 }
             }
 
-            context.log(`Sending the new message (draft ID: ${draftMessage.id})...`);
+            context.log(`Sending the new message (draft ID: ${draftMessage.id})...");
             await client.api(`/me/messages/${draftMessage.id}/send`).post({});
             context.log(`Successfully sent forwarded message. Original message ID was ${messageIdToProcess}.`);
 
-            context.log(`Moving original message (ID: ${messageIdToProcess}) to deleted items...`);
+            context.log(`Moving original message (ID: ${messageIdToProcess}) to deleted items...");
             await client.api(`/me/messages/${messageIdToProcess}/move`).post({ destinationId: "deleteditems" });
             context.log(`Successfully moved original message (ID: ${messageIdToProcess}) to deleted items.`);
 
